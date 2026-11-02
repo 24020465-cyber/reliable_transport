@@ -1,45 +1,72 @@
 import argparse
 import socket
+import sys
 
 from utils import PacketHeader, compute_checksum
 
+T_START, T_END, T_DATA, T_ACK = 0, 1, 2, 3
 
-def receiver(receiver_ip, receiver_port, window_size):
-    """TODO: Listen on socket and print received message to sys.stdout."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind((receiver_ip, receiver_port))
+
+def build_ack(seq):
+    hdr = PacketHeader(type=T_ACK, seq_num=seq, length=0, checksum=0)
+    hdr.checksum = compute_checksum(bytes(hdr))
+    return bytes(hdr)
+
+
+def decode(raw):
+    """Return (type, seq, body) for an intact packet, else None."""
+    if len(raw) < 16:
+        return None
+    hdr = PacketHeader(raw[:16])
+    body = raw[16:16 + hdr.length]
+    if len(body) != hdr.length:
+        return None
+    given = hdr.checksum
+    hdr.checksum = 0
+    if compute_checksum(bytes(hdr) + body) != given:
+        return None
+    return hdr.type, hdr.seq_num, body
+
+
+def run(ip, port, window):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((ip, port))
+    out = sys.stdout.buffer
+    next_seq = 0          # 0 means "no connection yet"
+    buffered = {}
+
     while True:
-        # Receive packet; address includes both IP and port
-        pkt, address = s.recvfrom(2048)
+        raw, peer = sock.recvfrom(2048)
+        got = decode(raw)
+        if got is None:
+            continue
+        kind, seq, body = got
 
-        # Extract header and payload
-        pkt_header = PacketHeader(pkt[:16])
-        msg = pkt[16 : 16 + pkt_header.length]
-
-        # Verity checksum
-        pkt_checksum = pkt_header.checksum
-        pkt_header.checksum = 0
-        computed_checksum = compute_checksum(pkt_header / msg)
-        if pkt_checksum != computed_checksum:
-            print("checksums not match")
-        print(msg)
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "receiver_ip", help="The IP address of the host that receiver is running on"
-    )
-    parser.add_argument(
-        "receiver_port", type=int, help="The port number on which receiver is listening"
-    )
-    parser.add_argument(
-        "window_size", type=int, help="Maximum number of outstanding packets"
-    )
-    args = parser.parse_args()
-
-    receiver(args.receiver_ip, args.receiver_port, args.window_size)
+        if kind == T_START:
+            if next_seq in (0, 1):
+                next_seq = 1
+                sock.sendto(build_ack(1), peer)
+        elif next_seq == 0:
+            continue
+        elif kind == T_DATA:
+            if seq >= next_seq + window:
+                continue
+            if seq >= next_seq:
+                buffered[seq] = body
+                while next_seq in buffered:
+                    out.write(buffered.pop(next_seq))
+                    next_seq += 1
+                out.flush()
+            sock.sendto(build_ack(seq), peer)    # ACK this exact packet
+        elif kind == T_END and seq == next_seq:
+            sock.sendto(build_ack(seq), peer)
+            break
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("receiver_ip")
+    ap.add_argument("receiver_port", type=int)
+    ap.add_argument("window_size", type=int)
+    a = ap.parse_args()
+    run(a.receiver_ip, a.receiver_port, a.window_size)
